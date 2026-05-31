@@ -1,0 +1,148 @@
+"""V2 PatchTST 训练 — 单步 + 简化损失 + 早停
+
+核心改动：
+1. rollout_steps=1，先让单步预测出非直线
+2. 损失简化为 MSE + 轻量梯度损失
+3. lr=0.0005（Transformer 需要比 RNN 更保守的学习率）
+4. 早停
+"""
+import json
+import os
+from pathlib import Path
+import sys
+
+import torch
+import torch.optim as optim
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from forecast_utils import (
+    AmplitudeForecastLoss,
+    amplitude_metrics,
+    forecast_target,
+    merge_metric_sums,
+    rollout_forecast,
+)
+
+from config_amplitude import args
+from dataset_amplitude import get_data
+from PatchTST import Model
+
+
+def evaluate(args, model, loader, scaler, rollout_steps=None):
+    model.eval()
+    metric_sums = []
+    with torch.no_grad():
+        for batch_x, batch_y in loader:
+            batch_x = batch_x.to(args.device)
+            batch_y = batch_y.to(args.device)
+            output = rollout_forecast(model, batch_x, args, rollout_steps)
+            target = forecast_target(batch_y, args, rollout_steps)
+            metric_sums.append(amplitude_metrics(output, target, scaler))
+    return merge_metric_sums(metric_sums)
+
+
+def train(args, train_loader, val_loader, scaler):
+    model = Model(args).to(args.device)
+    criterion = AmplitudeForecastLoss(args)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    os.makedirs(args.save_dir, exist_ok=True)
+    best_val = float("inf")
+    patience_counter = 0
+    patience = getattr(args, "patience", 15)
+    history = []
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Training PatchTST V2 on {args.device}")
+    print(f"seq_len={args.seq_len}, pred_len={args.pred_len}, rollout_steps={args.rollout_steps}")
+    print(f"patch_len={args.patch_len}, stride={args.stride}, d_model={args.d_model}")
+    print(f"e_layers={args.e_layers}, n_heads={args.n_heads}, dropout={args.dropout}")
+    print(f"Trainable params: {n_params:,}")
+
+    for epoch in range(1, args.epochs + 1):
+        # ── 训练 ──
+        model.train()
+        train_loss = 0.0
+        for batch_x, batch_y in train_loader:
+            batch_x = batch_x.to(args.device)
+            batch_y = batch_y.to(args.device)
+
+            optimizer.zero_grad()
+            output = model(batch_x)
+            # 取最后 pred_len 步作为预测
+            pred = output[:, -args.pred_len:, :]
+            target = batch_y[:, :args.pred_len, :]
+            loss = criterion(pred, target)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            train_loss += loss.item()
+
+        scheduler.step()
+        train_loss /= max(len(train_loader), 1)
+
+        # ── 验证 ──
+        val_metrics = evaluate(args, model, val_loader, scaler, rollout_steps=1)
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_mae_db": val_metrics["mae_db"],
+            "val_std_ratio": val_metrics["std_ratio"],
+        })
+
+        if val_metrics["mae_db"] < best_val:
+            best_val = val_metrics["mae_db"]
+            torch.save(model.state_dict(), args.model_path)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if epoch == 1 or epoch % 5 == 0:
+            print(
+                f"Epoch {epoch:03d}/{args.epochs} | train={train_loss:.6f} | "
+                f"val_mae_db={val_metrics['mae_db']:.4f} | "
+                f"val_std_ratio={val_metrics['std_ratio']:.3f} | "
+                f"best_val={best_val:.4f}"
+            )
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch} (patience={patience})")
+            break
+
+    return model, history
+
+
+if __name__ == "__main__":
+    train_loader, val_loader, test_loader, scaler, _, split = get_data(args)
+    model, history = train(args, train_loader, val_loader, scaler)
+
+    model.load_state_dict(torch.load(args.model_path, map_location=args.device))
+    test_direct = evaluate(args, model, test_loader, scaler, rollout_steps=1)
+    test_rollout = evaluate(args, model, test_loader, scaler, rollout_steps=4)
+
+    result = {
+        "model": "PatchTST_amplitude_v2",
+        "seq_len": args.seq_len,
+        "pred_len": args.pred_len,
+        "rollout_steps": args.rollout_steps,
+        "patch_len": args.patch_len,
+        "stride": args.stride,
+        "d_model": args.d_model,
+        "e_layers": args.e_layers,
+        "n_heads": args.n_heads,
+        "dropout": args.dropout,
+        "grad_loss_weight": args.grad_loss_weight,
+        "test_direct": test_direct,
+        "test_rollout_4step": test_rollout,
+        "history": history,
+    }
+    result_path = os.path.join(args.save_dir, "patchtst_amplitude_v2_results.json")
+    os.makedirs(args.save_dir, exist_ok=True)
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    print(f"\n{'='*60}")
+    print(f"Test Direct:  MAE={test_direct['mae_db']:.4f} dB  std_ratio={test_direct['std_ratio']:.3f}")
+    print(f"Test Rollout: MAE={test_rollout['mae_db']:.4f} dB  std_ratio={test_rollout['std_ratio']:.3f}")
+    print(f"Saved to {result_path}")
